@@ -61,7 +61,7 @@ async fn process_deposit(db: &PgPool, d: crate::blockchain::stellar::DetectedDep
     .await
     .map_err(|e| e.to_string())?;
 
-    if payment.status != "detected" {
+    if payment.status != crate::models::status::PaymentStatus::Detected {
         return Ok(());
     }
 

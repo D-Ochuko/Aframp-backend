@@ -134,3 +134,76 @@ fn error(status: StatusCode, code: ErrorCode, message: &str) -> (StatusCode, Jso
         }),
     )
 }
+
+// ---------------------------------------------------------------------------
+// From impls for service errors — enables `?` in handlers instead of
+// explicit `.map_err(map_*_error)` calls.
+// ---------------------------------------------------------------------------
+
+impl From<crate::services::users::UserError> for (StatusCode, Json<ApiError>) {
+    fn from(err: crate::services::users::UserError) -> Self {
+        use crate::services::users::UserError;
+        match err {
+            UserError::InvalidCredentials => {
+                unauthorized(ErrorCode::InvalidCredentials, "invalid email or password")
+            }
+            UserError::Database(_) => internal(err),
+        }
+    }
+}
+
+impl From<crate::services::otp::OtpError> for (StatusCode, Json<ApiError>) {
+    fn from(err: crate::services::otp::OtpError) -> Self {
+        use crate::services::otp::OtpError;
+        match err {
+            OtpError::RateLimited => {
+                too_many_requests(ErrorCode::TooManyRequests, "too many requests, please try again shortly")
+            }
+            OtpError::ChallengeNotFound => {
+                not_found(ErrorCode::OtpChallengeNotFound, "otp challenge not found or already used")
+            }
+            OtpError::Expired => bad_request(ErrorCode::OtpExpired, "otp code has expired"),
+            OtpError::Locked => bad_request(
+                ErrorCode::OtpLocked,
+                "too many incorrect attempts — request a new code",
+            ),
+            OtpError::InvalidCode => bad_request(ErrorCode::OtpInvalid, "incorrect code"),
+            OtpError::EmailTaken => conflict(ErrorCode::EmailTaken, "email already registered"),
+            OtpError::PhoneTaken => conflict(ErrorCode::PhoneTaken, "phone number already registered"),
+            OtpError::SendFailed(_) | OtpError::Database(_) => internal(err),
+        }
+    }
+}
+
+impl From<crate::services::withdrawals::WithdrawalError> for (StatusCode, Json<ApiError>) {
+    fn from(err: crate::services::withdrawals::WithdrawalError) -> Self {
+        use crate::services::withdrawals::WithdrawalError;
+        match err {
+            WithdrawalError::InsufficientBalance => {
+                bad_request(ErrorCode::InsufficientBalance, "insufficient available balance")
+            }
+            WithdrawalError::UnsupportedAsset => bad_request(
+                ErrorCode::UnsupportedAsset,
+                "withdrawals are only supported for the cNGN asset",
+            ),
+            WithdrawalError::InvalidAmountPrecision => bad_request(
+                ErrorCode::InvalidAmount,
+                "amount_stroops must be a whole number of kobo",
+            ),
+            WithdrawalError::PayoutFailed(msg) => bad_gateway(ErrorCode::PayoutFailed, &msg),
+            WithdrawalError::Database(e) => internal(e),
+        }
+    }
+}
+
+impl From<crate::services::payment_requests::PaymentRequestError> for (StatusCode, Json<ApiError>) {
+    fn from(err: crate::services::payment_requests::PaymentRequestError) -> Self {
+        use crate::services::payment_requests::PaymentRequestError;
+        match err {
+            PaymentRequestError::InvalidAmount => {
+                bad_request(ErrorCode::InvalidAmount, "amount_stroops must be positive")
+            }
+            PaymentRequestError::Database(e) => internal(e),
+        }
+    }
+}

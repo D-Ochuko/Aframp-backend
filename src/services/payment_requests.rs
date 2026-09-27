@@ -3,6 +3,7 @@ use rand::RngCore;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::models::status::PaymentRequestStatus;
 use crate::models::PaymentRequest;
 
 const DEFAULT_EXPIRY_SECS: i64 = 15 * 60;
@@ -67,7 +68,7 @@ pub struct PaymentRequestWithWallet {
     pub amount_stroops: i64,
     pub asset: String,
     pub memo: String,
-    pub status: String,
+    pub status: PaymentRequestStatus,
     pub payment_id: Option<Uuid>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -166,19 +167,21 @@ pub async fn find_pending_by_wallet_and_memo(
         "SELECT id, merchant_id, wallet_id, amount_stroops, asset, memo, status, payment_id,
                 expires_at, created_at, updated_at
            FROM payment_requests
-          WHERE wallet_id = $1 AND memo = $2 AND status = 'pending'",
+          WHERE wallet_id = $1 AND memo = $2 AND status = $3",
     )
     .bind(wallet_id)
     .bind(memo)
+    .bind(PaymentRequestStatus::Pending)
     .fetch_optional(db)
     .await
 }
 
 pub async fn mark_paid(db: &PgPool, id: Uuid, payment_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE payment_requests SET status = 'paid', payment_id = $2, updated_at = now() WHERE id = $1",
+        "UPDATE payment_requests SET status = $2, payment_id = $3, updated_at = now() WHERE id = $1",
     )
     .bind(id)
+    .bind(PaymentRequestStatus::Paid)
     .bind(payment_id)
     .execute(db)
     .await
@@ -187,9 +190,10 @@ pub async fn mark_paid(db: &PgPool, id: Uuid, payment_id: Uuid) -> Result<(), sq
 
 pub async fn mark_partial(db: &PgPool, id: Uuid, payment_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE payment_requests SET status = 'partial', payment_id = $2, updated_at = now() WHERE id = $1",
+        "UPDATE payment_requests SET status = $2, payment_id = $3, updated_at = now() WHERE id = $1",
     )
     .bind(id)
+    .bind(PaymentRequestStatus::Partial)
     .bind(payment_id)
     .execute(db)
     .await

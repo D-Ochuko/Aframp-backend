@@ -3,10 +3,10 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::auth::extractor::AuthUser;
-use crate::error::{bad_gateway, bad_request, bad_request_field, internal, ApiResult, ErrorCode};
+use crate::error::{bad_request, bad_request_field, internal, ApiResult, ErrorCode};
 use crate::models::{CreateWithdrawalRequest, NewWithdrawal, Withdrawal};
 use crate::pagination::{Cursor, Page};
-use crate::services::withdrawals::{self, WithdrawalError};
+use crate::services::withdrawals;
 use crate::validation::{is_valid_account_number, is_valid_bank_code};
 use crate::AppState;
 
@@ -50,8 +50,7 @@ pub async fn create(
             account_number: req.account_number,
         },
     )
-    .await
-    .map_err(map_withdrawal_error)?;
+    .await?;
     Ok(Json(withdrawal))
 }
 
@@ -76,22 +75,4 @@ pub async fn list(
         created_at: w.created_at,
         id: w.id,
     })))
-}
-
-fn map_withdrawal_error(err: WithdrawalError) -> (axum::http::StatusCode, Json<crate::error::ApiError>) {
-    match err {
-        WithdrawalError::InsufficientBalance => {
-            bad_request(ErrorCode::InsufficientBalance, "insufficient available balance")
-        }
-        WithdrawalError::UnsupportedAsset => bad_request(
-            ErrorCode::UnsupportedAsset,
-            "withdrawals are only supported for the cNGN asset",
-        ),
-        WithdrawalError::InvalidAmountPrecision => bad_request(
-            ErrorCode::InvalidAmount,
-            "amount_stroops must be a whole number of kobo",
-        ),
-        WithdrawalError::PayoutFailed(msg) => bad_gateway(ErrorCode::PayoutFailed, &msg),
-        WithdrawalError::Database(e) => internal(e),
-    }
 }
