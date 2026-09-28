@@ -1,6 +1,8 @@
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use axum::Json;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::auth::extractor::AuthUser;
 use crate::error::{bad_gateway, bad_request, bad_request_field, internal, ApiResult, ErrorCode};
@@ -19,8 +21,12 @@ pub struct ListParams {
 pub async fn create(
     State(state): State<AppState>,
     auth: AuthUser,
-    Json(req): Json<CreateWithdrawalRequest>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
 ) -> ApiResult<Json<Withdrawal>> {
+    let req = CreateWithdrawalRequest::from_json(&body)
+        .map_err(|(field, msg)| bad_request_field(field, msg))?;
+
     let merchant_id = auth
         .merchant_id
         .ok_or_else(|| bad_request(ErrorCode::MerchantNotFound, "no merchant associated with this account"))?;
@@ -39,6 +45,12 @@ pub async fn create(
             "must be a 10-digit NUBAN account number",
         ));
     }
+    let idempotency_key = headers
+        .get("Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_owned);
     let withdrawal = withdrawals::create_withdrawal(
         &state.db,
         state.payment_provider.as_ref(),
@@ -48,6 +60,7 @@ pub async fn create(
             asset: req.asset.unwrap_or_else(|| "cNGN".into()),
             bank_code: req.bank_code,
             account_number: req.account_number,
+            idempotency_key,
         },
     )
     .await
