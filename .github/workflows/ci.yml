@@ -149,6 +149,7 @@ jobs:
           OTP_PROVIDER: mock
         run: cargo test --all
 
+      - name: Run property-based tests (normalize_ng_phone_number)
       # Snapshot tests for API error response shapes (issue #1089).
       # `cargo insta test` runs the suite and fails the build if any snapshot
       # is missing or differs from the committed .snap files, so a refactor
@@ -164,6 +165,7 @@ jobs:
           PAYSTACK_SECRET_KEY: sk_test_placeholder
           OTP_HMAC_SECRET: test-otp-hmac-secret-at-least-32chars
           OTP_PROVIDER: mock
+        run: cargo test --all -- --nocapture normalize_ng_phone_number
           INSTA_UPDATE: no
         run: |
           cargo install cargo-insta --locked
