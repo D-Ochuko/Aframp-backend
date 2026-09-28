@@ -2,6 +2,8 @@ use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde_json::Value;
 
 use crate::auth::extractor::AuthUser;
 use crate::error::{bad_gateway, bad_request, bad_request_field, internal, ApiResult, ErrorCode};
@@ -66,11 +68,27 @@ pub async fn create(
     State(state): State<AppState>,
     auth: AuthUser,
     headers: HeaderMap,
-    Json(req): Json<CreateWithdrawalRequest>,
+    Json(body): Json<Value>,
 ) -> ApiResult<Json<Withdrawal>> {
+    let req = CreateWithdrawalRequest::from_json(&body)
+        .map_err(|(field, msg)| bad_request_field(field, msg))?;
+
     let merchant_id = auth
         .merchant_id
         .ok_or_else(|| bad_request(ErrorCode::MerchantNotFound, "no merchant associated with this account"))?;
+
+    // Refuse if the merchant is suspended.
+    let merchant = crate::services::users::merchant_by_id(&state.db, merchant_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| bad_request(ErrorCode::MerchantNotFound, "merchant not found"))?;
+    if merchant.is_suspended() {
+        return Err(crate::error::forbidden(
+            ErrorCode::Forbidden,
+            "this merchant account has been suspended",
+        ));
+    }
+
     if req.amount_stroops <= 0 {
         return Err(bad_request_field(
             "amount_stroops",

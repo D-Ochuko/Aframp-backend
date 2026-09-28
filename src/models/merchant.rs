@@ -1,9 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sqlx::FromRow;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Merchant {
     pub id: Uuid,
     pub user_id: Uuid,
@@ -11,7 +10,18 @@ pub struct Merchant {
     pub email: Option<String>,
     pub email_notifications_enabled: bool,
     pub unsubscribe_token: Option<String>,
+    /// `Some` when the merchant account is suspended. The timestamp records
+    /// when the suspension was applied. `None` means the account is active.
+    pub suspended_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Merchant {
+    /// Returns `true` if this merchant is currently suspended.
+    pub fn is_suspended(&self) -> bool {
+        self.suspended_at.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]

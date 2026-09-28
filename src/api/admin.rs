@@ -3,18 +3,20 @@ use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::extract::{Path, Query, State};
 use axum::response::Html;
 use axum::Json;
 use futures::stream::{self, Stream};
 use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use uuid::Uuid;
 
 use crate::auth::extractor::AdminUser;
-use crate::error::{internal, ApiResult};
+use crate::error::{internal, not_found, ApiResult, ErrorCode};
 use crate::models::{
     AdminMerchantRow, AdminOverview, AdminPaymentRequestRow, AdminTransactionRow, AdminUserRow,
-    AdminWalletRow, AdminWithdrawalRow,
+    AdminWalletRow, AdminWithdrawalRow, Merchant,
 };
 use crate::services::admin;
 use crate::AppState;
@@ -106,6 +108,49 @@ pub async fn events(
         Err(_) => None,
     });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+/// `POST /admin/merchants/{id}/suspend` — suspend a merchant account.
+/// The merchant will receive 403 on /login, /payment-requests, and /withdraw
+/// until unsuspended.
+pub async fn suspend_merchant(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Merchant>> {
+    let merchant = admin::suspend_merchant(&state.db, id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| not_found(ErrorCode::MerchantNotFound, "merchant not found"))?;
+    Ok(Json(merchant))
+}
+
+/// `POST /admin/merchants/{id}/unsuspend` — reinstate a suspended merchant.
+pub async fn unsuspend_merchant(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Merchant>> {
+    let merchant = admin::unsuspend_merchant(&state.db, id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| not_found(ErrorCode::MerchantNotFound, "merchant not found"))?;
+    Ok(Json(merchant))
+}
+
+/// `POST /admin/users/{id}/unlock` — clear an account lockout applied by the
+/// failed-login counter. Also resets `failed_login_count` to 0.
+pub async fn unlock_user(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<axum::http::StatusCode> {
+    let found = admin::unlock_user(&state.db, id)
+        .await
+        .map_err(internal)?;
+    if found {
+        Ok(axum::http::StatusCode::NO_CONTENT)
+    } else {
+        Err(not_found(ErrorCode::UserNotFound, "user not found"))
+    }
 }
 
 /// Static dashboard shell. Unauthenticated by design — it's markup and JS with
