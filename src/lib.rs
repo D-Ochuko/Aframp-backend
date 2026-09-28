@@ -1,6 +1,90 @@
 use axum::{routing::get, Json, Router};
 use serde::Serialize;
 
+pub use auth::cookie::{CookieConfig, SameSite};
+pub use config::{AppConfig, OtpProviderKind, SecretString};
+
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use tokio::sync::broadcast;
+
+/// Events broadcast to connected admin dashboard SSE clients.
+#[derive(Clone, Debug)]
+pub enum AdminEvent {
+    NewPayment,
+    NewWithdrawal,
+    NewSignup,
+    WithdrawalFailed,
+}
+
+impl AdminEvent {
+    /// SSE event name emitted to clients.
+    pub fn name(&self) -> &'static str {
+        match self {
+            AdminEvent::NewPayment => "new_payment",
+            AdminEvent::NewWithdrawal => "new_withdrawal",
+            AdminEvent::NewSignup => "new_signup",
+            AdminEvent::WithdrawalFailed => "withdrawal_failed",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db: PgPool,
+    pub jwt_secret: SecretString,
+    pub webhook_secret: SecretString,
+    pub wallet_encryption_key: std::sync::Arc<[u8; 32]>,
+    pub payment_provider: std::sync::Arc<dyn payments::PaymentProvider>,
+    pub otp_provider: std::sync::Arc<dyn otp::OtpProvider>,
+    pub otp_hmac_secret: SecretString,
+    pub cookie: CookieConfig,
+    pub admin_events: broadcast::Sender<AdminEvent>,
+}
+
+impl AppState {
+    /// Broadcast an admin event to all connected SSE clients.
+    ///
+    /// Errors (e.g. no active subscribers) are intentionally ignored so that
+    /// emitting an event never fails the originating request.
+    pub fn emit_admin_event(&self, event: AdminEvent) {
+        let _ = self.admin_events.send(event);
+    }
+}
+
+pub async fn build_state(config: &AppConfig) -> Result<AppState, Box<dyn std::error::Error>> {
+    let db = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&config.database_url)
+        .await?;
+    let wallet_encryption_key = blockchain::wallet_crypto::parse_key(config.wallet_encryption_key.as_str())?;
+    let otp_provider: std::sync::Arc<dyn otp::OtpProvider> = match config.otp_provider {
+        OtpProviderKind::Termii => std::sync::Arc::new(otp::termii::TermiiProvider::new(
+            config
+                .termii_api_key
+                .as_ref()
+                .expect("TERMII_API_KEY is required when OTP_PROVIDER=termii")
+                .as_str()
+                .to_string(),
+            config
+                .termii_sender_id
+                .clone()
+                .expect("TERMII_SENDER_ID is required when OTP_PROVIDER=termii"),
+        )),
+        OtpProviderKind::Mock => std::sync::Arc::new(otp::mock::MockOtpProvider),
+    };
+    let (admin_events, _) = broadcast::channel(256);
+    Ok(AppState {
+        db,
+        jwt_secret: config.jwt_secret.clone(),
+        webhook_secret: config.webhook_secret.clone(),
+        wallet_encryption_key: std::sync::Arc::new(wallet_encryption_key),
+        payment_provider: std::sync::Arc::new(payments::paystack::PaystackProvider::new(
+            config.paystack_secret_key.as_str().to_string(),
+        )),
+        otp_provider,
+        otp_hmac_secret: config.otp_hmac_secret.clone(),
+        cookie: config.cookie,
+        admin_events,
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -57,6 +141,7 @@ pub fn router(state: AppState) -> axum::Router {
             "/admin/payment-requests",
             axum::routing::get(api::admin::payment_requests),
         )
+        .route("/admin/events", axum::routing::get(api::admin::events))
         .route(
             "/admin/merchants/{id}/suspend",
             axum::routing::post(api::admin::suspend_merchant),
