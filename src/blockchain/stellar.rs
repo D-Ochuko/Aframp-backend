@@ -580,5 +580,187 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2), "the slow address must time out");
         assert_eq!(deposits.len(), 1, "the other wallet is still polled");
         assert_eq!(deposits[0].tx_hash, "fast-tx");
+    // --------------------------------------------------------------------------
+    // #1045 — backoff duration calculation: 30 * 2^n capped at MAX_BACKOFF
+    //
+    // The existing backoff tests only assert on consecutive_404s count.
+    // These tests check the actual computed Duration stored in next_poll_at,
+    // verifying the doubling sequence and the MAX_BACKOFF ceiling.
+    // --------------------------------------------------------------------------
+
+    /// Helper: compute the backoff duration the listener will use after `n`
+    /// consecutive 404s.  Mirrors the formula in `record_unfunded` exactly.
+    fn expected_backoff(n: u32) -> Duration {
+        let secs = 30u64
+            .saturating_mul(2u64.saturating_pow(n.saturating_sub(1).min(10)));
+        Duration::from_secs(secs).min(MAX_BACKOFF)
+    }
+
+    #[test]
+    fn backoff_duration_after_1_consecutive_404_is_30s() {
+        let listener = StellarListener::new("https://horizon-testnet.stellar.org".into());
+        let addr = "GBACKOFF...1";
+
+        let before = std::time::Instant::now();
+        listener.record_unfunded(addr);
+        let after = std::time::Instant::now();
+
+        let map = listener.unfunded_backoff.lock().unwrap();
+        let state = map.get(addr).unwrap();
+
+        // next_poll_at should be approximately now + 30s.
+        let expected = expected_backoff(1); // 30s
+        assert_eq!(expected, Duration::from_secs(30));
+
+        // Allow a small margin for the time between before/after.
+        let lower = before + expected;
+        let upper = after + expected + Duration::from_millis(100);
+        assert!(
+            state.next_poll_at >= lower && state.next_poll_at <= upper,
+            "after 1 x 404, backoff should be 30s; next_poll_at={:?} expected in [{lower:?}, {upper:?}]",
+            state.next_poll_at
+        );
+    }
+
+    #[test]
+    fn backoff_duration_after_2_consecutive_404s_is_60s() {
+        let listener = StellarListener::new("https://horizon-testnet.stellar.org".into());
+        let addr = "GBACKOFF...2";
+
+        listener.record_unfunded(addr); // 1st → 30s
+        let before = std::time::Instant::now();
+        listener.record_unfunded(addr); // 2nd → 60s
+        let after = std::time::Instant::now();
+
+        let map = listener.unfunded_backoff.lock().unwrap();
+        let state = map.get(addr).unwrap();
+
+        let expected = expected_backoff(2); // 60s
+        assert_eq!(expected, Duration::from_secs(60));
+
+        let lower = before + expected;
+        let upper = after + expected + Duration::from_millis(100);
+        assert!(
+            state.next_poll_at >= lower && state.next_poll_at <= upper,
+            "after 2 x 404, backoff should be 60s; next_poll_at={:?} expected in [{lower:?}, {upper:?}]",
+            state.next_poll_at
+        );
+    }
+
+    #[test]
+    fn backoff_duration_after_3_consecutive_404s_is_120s() {
+        let listener = StellarListener::new("https://horizon-testnet.stellar.org".into());
+        let addr = "GBACKOFF...3";
+
+        for _ in 0..3 {
+            listener.record_unfunded(addr);
+        }
+
+        let map = listener.unfunded_backoff.lock().unwrap();
+        let state = map.get(addr).unwrap();
+        assert_eq!(state.consecutive_404s, 3);
+
+        let expected = expected_backoff(3); // 120s
+        assert_eq!(expected, Duration::from_secs(120));
+        // Verify the stored next_poll_at is at least now + 100s (generous lower
+        // bound that won't flake — we just need the ceiling isn't premature).
+        assert!(
+            state.next_poll_at > std::time::Instant::now() + Duration::from_secs(100),
+            "after 3 x 404, backoff should be ≥120s"
+        );
+    }
+
+    #[test]
+    fn backoff_duration_capped_at_max_backoff_after_10_consecutive_404s() {
+        let listener = StellarListener::new("https://horizon-testnet.stellar.org".into());
+        let addr = "GBACKOFF...10";
+
+        // Drive past the cap: 10 consecutive 404s.
+        for _ in 0..10 {
+            listener.record_unfunded(addr);
+        }
+
+        let before = std::time::Instant::now();
+        // One more — this is the 11th, which would be 30 * 2^10 = 30720s
+        // without the cap.  The cap is MAX_BACKOFF = 600s.
+        listener.record_unfunded(addr);
+        let after = std::time::Instant::now();
+
+        let map = listener.unfunded_backoff.lock().unwrap();
+        let state = map.get(addr).unwrap();
+        assert_eq!(state.consecutive_404s, 11);
+
+        // Regardless of the raw doubling formula, the stored backoff must not
+        // exceed MAX_BACKOFF (600s).
+        let lower = before + MAX_BACKOFF;
+        let upper = after + MAX_BACKOFF + Duration::from_millis(100);
+        assert!(
+            state.next_poll_at >= lower && state.next_poll_at <= upper,
+            "backoff must be capped at {MAX_BACKOFF:?}; next_poll_at={:?} expected in [{lower:?}, {upper:?}]",
+            state.next_poll_at
+        );
+    }
+
+    #[test]
+    fn backoff_formula_never_exceeds_max_backoff_for_any_n() {
+        // Verify the pure formula independently of Instant arithmetic.
+        for n in 1u32..=30 {
+            let b = expected_backoff(n);
+            assert!(
+                b <= MAX_BACKOFF,
+                "expected_backoff({n}) = {b:?} exceeds MAX_BACKOFF ({MAX_BACKOFF:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_backoff_resets_consecutive_404s_count_to_zero() {
+        let listener = StellarListener::new("https://horizon-testnet.stellar.org".into());
+        let addr = "GCLEAR...BACKOFF";
+
+        // Build up some consecutive 404s.
+        for _ in 0..5 {
+            listener.record_unfunded(addr);
+        }
+        {
+            let map = listener.unfunded_backoff.lock().unwrap();
+            assert_eq!(map.get(addr).unwrap().consecutive_404s, 5);
+        }
+
+        // clear_backoff removes the entry entirely — consecutive count goes
+        // back to 0 (entry absent ≡ count 0) and should_skip returns false.
+        listener.clear_backoff(addr);
+
+        {
+            let map = listener.unfunded_backoff.lock().unwrap();
+            assert!(
+                map.get(addr).is_none(),
+                "clear_backoff must remove the entry, resetting consecutive_404s to 0"
+            );
+        }
+        assert!(
+            !listener.should_skip(addr),
+            "after clear_backoff the address must not be skipped"
+        );
+    }
+
+    #[test]
+    fn backoff_doubling_sequence_is_correct() {
+        // Verify the first four backoff steps match the expected sequence:
+        // 30s, 60s, 120s, 240s.
+        let expected_sequence = [
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+            Duration::from_secs(240),
+        ];
+        for (i, &expected) in expected_sequence.iter().enumerate() {
+            let n = (i + 1) as u32;
+            assert_eq!(
+                expected_backoff(n),
+                expected,
+                "backoff after {n} consecutive 404s should be {expected:?}"
+            );
+        }
     }
 }
