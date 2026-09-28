@@ -4,6 +4,7 @@ use serde_json::Value;
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use super::status::WithdrawalStatus;
 use crate::validation::require_i64;
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -12,7 +13,7 @@ pub struct Withdrawal {
     pub merchant_id: Uuid,
     pub amount_stroops: i64,
     pub asset: String,
-    pub status: String,
+    pub status: WithdrawalStatus,
     pub provider: Option<String>,
     pub provider_reference: Option<String>,
     pub bank_code: Option<String>,

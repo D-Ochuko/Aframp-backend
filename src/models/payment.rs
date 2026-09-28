@@ -3,6 +3,8 @@ use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use super::status::PaymentStatus;
+
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Payment {
     pub id: Uuid,
@@ -13,7 +15,7 @@ pub struct Payment {
     pub amount_stroops: i64,
     pub asset: String,
     pub network: String,
-    pub status: String,
+    pub status: PaymentStatus,
     pub confirmations: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

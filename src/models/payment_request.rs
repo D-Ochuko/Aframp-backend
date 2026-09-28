@@ -4,6 +4,7 @@ use serde_json::Value;
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use super::status::PaymentRequestStatus;
 use crate::validation::{optional_i64, require_i64};
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -14,7 +15,7 @@ pub struct PaymentRequest {
     pub amount_stroops: i64,
     pub asset: String,
     pub memo: String,
-    pub status: String,
+    pub status: PaymentRequestStatus,
     pub payment_id: Option<Uuid>,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,

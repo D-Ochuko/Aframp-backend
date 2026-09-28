@@ -1,6 +1,7 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::models::status::PaymentStatus;
 use crate::models::{NewPayment, Payment, UpdatePaymentStatus};
 
 #[derive(Debug, thiserror::Error)]
@@ -30,7 +31,7 @@ pub async fn record_deposit(db: &PgPool, payment: NewPayment) -> Result<Payment,
         "INSERT INTO payments (
              merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset, network, status
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'detected')
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          RETURNING id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset,
                    network, status, confirmations, created_at, updated_at",
     )
@@ -41,6 +42,7 @@ pub async fn record_deposit(db: &PgPool, payment: NewPayment) -> Result<Payment,
     .bind(payment.amount_stroops)
     .bind(&payment.asset)
     .bind(&payment.network)
+    .bind(PaymentStatus::Detected)
     .fetch_one(db)
     .await
     .map_err(PaymentError::Database)
@@ -52,9 +54,9 @@ pub async fn set_status(
     new_status: UpdatePaymentStatus,
 ) -> Result<Option<Payment>, sqlx::Error> {
     let status = match new_status {
-        UpdatePaymentStatus::Verified => "verified",
-        UpdatePaymentStatus::Confirmed => "confirmed",
-        UpdatePaymentStatus::Failed => "failed",
+        UpdatePaymentStatus::Verified => PaymentStatus::Verified,
+        UpdatePaymentStatus::Confirmed => PaymentStatus::Confirmed,
+        UpdatePaymentStatus::Failed => PaymentStatus::Failed,
     };
     sqlx::query_as::<_, Payment>(
         "UPDATE payments

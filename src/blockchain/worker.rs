@@ -69,7 +69,7 @@ pub async fn process_deposit(db: &PgPool, d: DetectedDeposit) -> Result<(), Stri
     .await
     .map_err(|e| e.to_string())?;
 
-    if payment.status != "detected" {
+    if payment.status != crate::models::status::PaymentStatus::Detected {
         return Ok(());
     }
 

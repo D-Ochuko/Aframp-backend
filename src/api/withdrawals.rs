@@ -6,10 +6,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::auth::extractor::AuthUser;
-use crate::error::{bad_gateway, bad_request, bad_request_field, internal, ApiResult, ErrorCode};
+use crate::error::{bad_request, bad_request_field, internal, ApiResult, ErrorCode};
 use crate::models::{CreateWithdrawalRequest, NewWithdrawal, Withdrawal};
 use crate::pagination::{Cursor, Page};
-use crate::services::withdrawals::{self, WithdrawalError};
+use crate::services::withdrawals;
 use crate::validation::{is_valid_account_number, is_valid_bank_code};
 use crate::AppState;
 
@@ -122,8 +122,7 @@ pub async fn create(
             idempotency_key,
         },
     )
-    .await
-    .map_err(map_withdrawal_error)?;
+    .await?;
     Ok(Json(withdrawal))
 }
 

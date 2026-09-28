@@ -85,8 +85,7 @@ pub async fn create(
         asset,
         req.expires_in_secs,
     )
-    .await
-    .map_err(map_payment_request_error)?;
+    .await?;
 
     Ok(Json(to_view(&pr, &wallet.address, &wallet.network)))
 }
@@ -241,11 +240,11 @@ pub struct ListParams {
 
 /// A `pending` row whose expiry has passed is reported as `expired` at read
 /// time, so a request going stale needs no background job to flip it.
-fn effective_status(status: &str, expires_at: DateTime<Utc>) -> String {
-    if status == "pending" && expires_at < Utc::now() {
+fn effective_status(status: crate::models::status::PaymentRequestStatus, expires_at: DateTime<Utc>) -> String {
+    if status == crate::models::status::PaymentRequestStatus::Pending && expires_at < Utc::now() {
         "expired".to_string()
     } else {
-        status.to_string()
+        status.as_str().to_string()
     }
 }
 
@@ -258,7 +257,7 @@ fn to_view(pr: &PaymentRequest, address: &str, network: &str) -> PaymentRequestV
         amount_stroops: pr.amount_stroops,
         asset: pr.asset.clone(),
         memo: pr.memo.clone(),
-        status: effective_status(&pr.status, pr.expires_at),
+        status: effective_status(pr.status, pr.expires_at),
         expires_at: pr.expires_at,
         created_at: pr.created_at,
         sep7_uri: build_sep7_uri(address, pr.amount_stroops, &pr.asset, &pr.memo),
@@ -274,7 +273,7 @@ fn row_to_view(row: &payment_requests::PaymentRequestWithWallet) -> PaymentReque
         amount_stroops: row.amount_stroops,
         asset: row.asset.clone(),
         memo: row.memo.clone(),
-        status: effective_status(&row.status, row.expires_at),
+        status: effective_status(row.status, row.expires_at),
         expires_at: row.expires_at,
         created_at: row.created_at,
         sep7_uri: build_sep7_uri(&row.address, row.amount_stroops, &row.asset, &row.memo),
@@ -289,15 +288,4 @@ fn build_sep7_uri(address: &str, amount_stroops: i64, asset: &str, memo: &str) -
     Some(format!(
         "web+stellar:pay?destination={address}&amount={amount}&memo={memo}&memo_type=MEMO_TEXT"
     ))
-}
-
-fn map_payment_request_error(
-    err: payment_requests::PaymentRequestError,
-) -> (axum::http::StatusCode, Json<crate::error::ApiError>) {
-    match err {
-        payment_requests::PaymentRequestError::InvalidAmount => {
-            bad_request(ErrorCode::InvalidAmount, "amount_stroops must be positive")
-        }
-        payment_requests::PaymentRequestError::Database(e) => internal(e),
-    }
 }

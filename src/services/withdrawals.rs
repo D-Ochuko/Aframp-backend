@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::models::status::WithdrawalStatus;
 use crate::models::{NewWithdrawal, Withdrawal};
 use crate::payments::{PaymentProvider, PayoutRequest};
 
@@ -175,6 +176,7 @@ pub async fn create_withdrawal_idempotent(
              merchant_id, amount_stroops, asset, status, bank_code, account_number,
              idempotency_key
          )
+         VALUES ($1, $2, $3, $4, $5, $6)
          VALUES ($1, $2, $3, 'pending', $4, $5, $6)
          ON CONFLICT (merchant_id, idempotency_key) DO NOTHING
          RETURNING id, merchant_id, amount_stroops, asset, status, provider,
@@ -184,6 +186,7 @@ pub async fn create_withdrawal_idempotent(
     .bind(withdrawal.merchant_id)
     .bind(withdrawal.amount_stroops)
     .bind(&withdrawal.asset)
+    .bind(WithdrawalStatus::Pending)
     .bind(&withdrawal.bank_code)
     .bind(&withdrawal.account_number)
     .bind(idempotency_key)
@@ -260,10 +263,11 @@ pub async fn create_withdrawal_idempotent(
 
             sqlx::query(
                 "UPDATE withdrawals
-                    SET status = 'failed', failure_reason = $2, updated_at = now()
+                    SET status = $2, failure_reason = $3, updated_at = now()
                   WHERE id = $1",
             )
             .bind(w.id)
+            .bind(WithdrawalStatus::Failed)
             .bind(&err)
             .execute(&mut *refund_tx)
             .await?;

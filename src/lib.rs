@@ -33,6 +33,16 @@ pub struct AppState {
     pub db: PgPool,
     pub jwt_secret: SecretString,
     pub webhook_secret: SecretString,
+    /// AES-256-GCM key used to encrypt wallet private keys at rest.
+    ///
+    /// Currently only consumed by `services::wallets::create_wallet` for
+    /// *encryption*.  Decryption (needed to sign Stellar transactions) is not
+    /// yet wired into any handler or the deposit worker — the worker only reads
+    /// the public wallet address.
+    ///
+    /// TODO: wire `decrypt_wallet_secret` into the settlement/sweep feature
+    /// so the platform wallet can sign outbound transactions on behalf of a
+    /// merchant.  See PRD §settlement-sweep.
     pub wallet_encryption_key: std::sync::Arc<[u8; 32]>,
     pub payment_provider: std::sync::Arc<dyn payments::PaymentProvider>,
     pub otp_provider: std::sync::Arc<dyn otp::OtpProvider>,
