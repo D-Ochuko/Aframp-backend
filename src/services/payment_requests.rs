@@ -9,10 +9,27 @@ const DEFAULT_EXPIRY_SECS: i64 = 15 * 60;
 const MIN_EXPIRY_SECS: i64 = 60;
 const MAX_EXPIRY_SECS: i64 = 24 * 60 * 60;
 
+/// Default edge length (in pixels) of a rendered payment request QR code.
+pub const DEFAULT_QR_SIZE: u32 = 256;
+/// Smallest QR image we will render, to keep codes scannable.
+pub const MIN_QR_SIZE: u32 = 64;
+/// Largest QR image we will render, to bound memory/CPU per request.
+pub const MAX_QR_SIZE: u32 = 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PaymentRequestError {
     #[error("amount_stroops must be positive")]
     InvalidAmount,
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum QrError {
+    #[error("payment request not found")]
+    NotFound,
+    #[error("failed to encode QR code: {0}")]
+    Encode(String),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
@@ -194,4 +211,249 @@ pub async fn mark_partial(db: &PgPool, id: Uuid, payment_id: Uuid) -> Result<(),
     .execute(db)
     .await
     .map(|_| ())
+}
+
+/// Clamps a caller-supplied `size` query parameter into the supported range,
+/// falling back to [`DEFAULT_QR_SIZE`] when absent.
+pub fn normalize_qr_size(size: Option<u32>) -> u32 {
+    size.unwrap_or(DEFAULT_QR_SIZE).clamp(MIN_QR_SIZE, MAX_QR_SIZE)
+}
+
+/// Renders `sep7_uri` as a PNG QR code with an edge length of `size` pixels.
+///
+/// The QR module grid is scaled up by an integer factor so the resulting image
+/// stays crisp, then padded with a quiet zone and centered on a white canvas of
+/// exactly `size` x `size` pixels.
+pub fn render_qr_png(sep7_uri: &str, size: u32) -> Result<Vec<u8>, QrError> {
+    use image::{ImageBuffer, Luma};
+    use qrcode::QrCode;
+
+    let size = normalize_qr_size(Some(size));
+    let code = QrCode::new(sep7_uri.as_bytes()).map_err(|e| QrError::Encode(e.to_string()))?;
+    let modules = code.to_colors();
+    let width = code.width() as u32;
+
+    // Quiet zone (4 modules) required by the QR spec for reliable scanning.
+    let quiet = 4u32;
+    let total_modules = width + quiet * 2;
+    let scale = (size / total_modules).max(1);
+    let rendered = total_modules * scale;
+    let offset = (size.saturating_sub(rendered)) / 2;
+
+    let mut img: ImageBuffer<Luma<u8>, Vec<u8>> =
+        ImageBuffer::from_pixel(size, size, Luma([255u8]));
+
+    for y in 0..width {
+        for x in 0..width {
+            let idx = (y * width + x) as usize;
+            if modules[idx] == qrcode::Color::Dark {
+                let px0 = offset + (x + quiet) * scale;
+                let py0 = offset + (y + quiet) * scale;
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let px = px0 + dx;
+                        let py = py0 + dy;
+                        if px < size && py < size {
+                            img.put_pixel(px, py, Luma([0u8]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut png = Vec::new();
+    image::DynamicImage::ImageLuma8(img)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| QrError::Encode(e.to_string()))?;
+    Ok(png)
+}
+
+/// Builds the SEP-7 URI a wallet should scan to pay this request.
+pub fn sep7_uri_for(request: &PaymentRequest, address: &str, network: &str) -> String {
+    let amount = request.amount_stroops as f64 / 10_000_000f64;
+    format!(
+        "web+stellar:pay?destination={}&amount={}&asset_code={}&memo={}&memo_type=text&network={}",
+        address, amount, request.asset, request.memo, network
+    )
+}
+
+/// Renders the QR code image for a payment request, caching the result by
+/// `(id, size)` so repeated POS polls don't re-encode the same PNG.
+pub async fn payment_request_qr_png(
+    db: &PgPool,
+    cache: &crate::services::qr_cache::QrCache,
+    id: Uuid,
+    size: Option<u32>,
+) -> Result<Vec<u8>, QrError> {
+    let size = normalize_qr_size(size);
+    if let Some(png) = cache.get(id, size) {
+        return Ok(png);
+    }
+
+    let request = payment_request_by_id(db, id)
+        .await?
+        .ok_or(QrError::NotFound)?;
+
+    let wallet = sqlx::query_as::<_, (String, String)>(
+        "SELECT address, network FROM wallets WHERE id = $1",
+    )
+    .bind(request.wallet_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or(QrError::NotFound)?;
+
+    let uri = sep7_uri_for(&request, &wallet.0, &wallet.1);
+    let png = render_qr_png(&uri, size)?;
+    cache.insert(id, size, png.clone());
+    Ok(png)
+#[cfg(test)]
+mod onboarding_e2e_tests {
+    use super::*;
+    use crate::otp::mock::MockOtpProvider;
+    use crate::otp::OtpProvider;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// Minimal stand-in for the production blockchain listener. The e2e test
+    /// injects a single fake deposit through this trait instead of talking to
+    /// a real chain, so the handoff from "deposit detected" to "request paid"
+    /// and "balance credited" is exercised deterministically.
+    #[async_trait::async_trait]
+    trait BlockchainListener {
+        async fn inject_deposit(
+            &self,
+            db: &PgPool,
+            wallet_id: Uuid,
+            memo: &str,
+            amount_stroops: i64,
+        ) -> Result<Uuid, sqlx::Error>;
+    }
+
+    struct MockBlockchainListener;
+
+    #[async_trait::async_trait]
+    impl BlockchainListener for MockBlockchainListener {
+        async fn inject_deposit(
+            &self,
+            db: &PgPool,
+            wallet_id: Uuid,
+            memo: &str,
+            amount_stroops: i64,
+        ) -> Result<Uuid, sqlx::Error> {
+            // Record the deposit, then correlate it to the pending request via
+            // its memo and mark that request paid — mirroring what the real
+            // listener does when it observes an on-chain transfer.
+            let payment_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO payments (wallet_id, amount_stroops, asset, memo, status)
+                 VALUES ($1, $2, 'XLM', $3, 'confirmed')
+                 RETURNING id",
+            )
+            .bind(wallet_id)
+            .bind(amount_stroops)
+            .bind(memo)
+            .fetch_one(db)
+            .await?;
+
+            if let Some(pr) = find_pending_by_wallet_and_memo(db, wallet_id, memo).await? {
+                mark_paid(db, pr.id, payment_id).await?;
+            }
+
+            sqlx::query(
+                "UPDATE wallets SET balance_stroops = balance_stroops + $2 WHERE id = $1",
+            )
+            .bind(wallet_id)
+            .bind(amount_stroops)
+            .execute(db)
+            .await?;
+
+            Ok(payment_id)
+        }
+    }
+
+    /// End-to-end merchant onboarding: signup -> OTP verify -> create wallet ->
+    /// create payment request -> detect deposit -> check balance.
+    #[sqlx::test]
+    async fn full_merchant_onboarding_flow(db: PgPool) {
+        let otp = MockOtpProvider::new();
+        let listener = MockBlockchainListener;
+
+        // 1. Signup.
+        let email = "merchant@example.com";
+        let merchant_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO merchants (email, name, status)
+             VALUES ($1, 'Test Merchant', 'pending')
+             RETURNING id",
+        )
+        .bind(email)
+        .fetch_one(&db)
+        .await
+        .expect("merchant signup should succeed");
+
+        // 2. OTP verify (MockOtpProvider skips real SMS).
+        let code = otp
+            .send_code(email)
+            .await
+            .expect("mock OTP send should succeed");
+        let verified = otp
+            .verify_code(email, &code)
+            .await
+            .expect("mock OTP verify should succeed");
+        assert!(verified, "OTP verification should succeed");
+
+        sqlx::query("UPDATE merchants SET status = 'active' WHERE id = $1")
+            .bind(merchant_id)
+            .execute(&db)
+            .await
+            .expect("merchant activation should succeed");
+
+        // 3. Create wallet.
+        let wallet_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO wallets (merchant_id, address, network, balance_stroops)
+             VALUES ($1, 'GTESTWALLETADDRESS', 'testnet', 0)
+             RETURNING id",
+        )
+        .bind(merchant_id)
+        .fetch_one(&db)
+        .await
+        .expect("wallet creation should succeed");
+
+        // 4. Create payment request.
+        let amount_stroops: i64 = 10_000_000;
+        let pr = create_payment_request(
+            &db,
+            merchant_id,
+            wallet_id,
+            amount_stroops,
+            "XLM".to_string(),
+            None,
+        )
+        .await
+        .expect("payment request creation should succeed");
+        assert_eq!(pr.status, "pending");
+
+        // 5. Detect deposit via the mock listener.
+        listener
+            .inject_deposit(&db, wallet_id, &pr.memo, amount_stroops)
+            .await
+            .expect("deposit injection should succeed");
+
+        // 6. Check balance equals the deposit amount.
+        let balance: i64 = sqlx::query_scalar(
+            "SELECT balance_stroops FROM wallets WHERE id = $1",
+        )
+        .bind(wallet_id)
+        .fetch_one(&db)
+        .await
+        .expect("balance lookup should succeed");
+        assert_eq!(balance, amount_stroops, "balance should equal the deposit");
+
+        // And the payment request should now be marked paid.
+        let updated = payment_request_by_id(&db, pr.id)
+            .await
+            .expect("payment request lookup should succeed")
+            .expect("payment request should exist");
+        assert_eq!(updated.status, "paid");
+        assert!(updated.payment_id.is_some());
+    }
 }

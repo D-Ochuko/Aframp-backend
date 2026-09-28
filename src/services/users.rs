@@ -2,8 +2,8 @@ use chrono::Utc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::auth::password;
-use crate::models::{Merchant, User};
+use crate::models::merchant::Merchant;
+use crate::models::user::User;
 
 /// Number of consecutive failed login attempts before an account is locked.
 const MAX_FAILED_ATTEMPTS: i32 = 10;
@@ -167,6 +167,9 @@ pub async fn login(db: &PgPool, email: &str, password_raw: &str) -> Result<(User
 pub async fn user_by_id(db: &PgPool, user_id: Uuid) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
         &format!("SELECT {USER_COLS} FROM users WHERE id = $1"),
+pub async fn user_by_id(db: &PgPool, user_id: Uuid) -> sqlx::Result<Option<User>> {
+    sqlx::query_as::<_, User>(
+        "SELECT id, email, name, is_admin, created_at FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_optional(db)
@@ -176,6 +179,9 @@ pub async fn user_by_id(db: &PgPool, user_id: Uuid) -> Result<Option<User>, sqlx
 pub async fn merchant_by_user(db: &PgPool, user_id: Uuid) -> Result<Option<Merchant>, sqlx::Error> {
     sqlx::query_as::<_, Merchant>(
         "SELECT id, user_id, name, suspended_at, created_at FROM merchants WHERE user_id = $1 LIMIT 1",
+pub async fn merchant_by_user(db: &PgPool, user_id: Uuid) -> sqlx::Result<Option<Merchant>> {
+    sqlx::query_as::<_, Merchant>(
+        "SELECT id, user_id, name, created_at, updated_at FROM merchants WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(db)

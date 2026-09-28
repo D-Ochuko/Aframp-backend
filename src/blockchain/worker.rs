@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 
-use crate::blockchain::stellar::{BlockchainListener, StellarListener};
+use crate::blockchain::stellar::{BlockchainListener, DetectedDeposit, StellarListener};
 use crate::models::{NewPayment, UpdateBalance, UpdatePaymentStatus};
 use crate::services::{balances, payment_requests, payments, wallets};
 use crate::AppState;
@@ -19,7 +19,15 @@ pub async fn run(state: Arc<AppState>, horizon_url: String, poll_interval_secs: 
     }
 }
 
-async fn poll_once(db: &PgPool, listener: &StellarListener) -> Result<(), String> {
+pub async fn poll_once(db: &PgPool, listener: &StellarListener) -> Result<(), String> {
+/// Polls the blockchain listener once and processes any detected deposits.
+///
+/// Generic over [`BlockchainListener`] so tests can inject a mock listener
+/// (e.g. to simulate a fake deposit) without hitting a real chain.
+pub async fn poll_once<L: BlockchainListener>(
+    db: &PgPool,
+    listener: &L,
+) -> Result<(), String> {
     let addresses: Vec<String> = wallets::all_wallets(db)
         .await
         .map_err(|e| e.to_string())?
@@ -39,7 +47,7 @@ async fn poll_once(db: &PgPool, listener: &StellarListener) -> Result<(), String
     Ok(())
 }
 
-async fn process_deposit(db: &PgPool, d: crate::blockchain::stellar::DetectedDeposit) -> Result<(), String> {
+pub async fn process_deposit(db: &PgPool, d: DetectedDeposit) -> Result<(), String> {
     let Some(wallet) = wallets::wallet_by_address(db, &d.destination).await.map_err(|e| e.to_string())?
     else {
         return Ok(());
@@ -89,7 +97,7 @@ async fn process_deposit(db: &PgPool, d: crate::blockchain::stellar::DetectedDep
         db,
         &UpdateBalance {
             merchant_id: wallet.merchant_id,
-            asset: d.asset,
+            asset: d.asset.clone(),
             available_delta: d.amount_stroops,
             pending_delta: -d.amount_stroops,
         },
@@ -120,6 +128,208 @@ async fn process_deposit(db: &PgPool, d: crate::blockchain::stellar::DetectedDep
         }
     }
 
+    // Sweep the confirmed merchant funds to the consolidated settlement wallet.
+    if let Err(err) = sweep_confirmed_payment(db, &wallet, &payment, &d.asset).await {
+        tracing::warn!(error = %err, payment_id = %payment.id, "platform sweep failed");
+    }
+
     // TODO: dispatch payment.confirmed webhook.
     Ok(())
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+    use crate::blockchain::stellar::StellarListener;
+    use sqlx::PgPool;
+    use std::time::Instant;
+
+    /// Number of merchants/wallets registered for the load test.
+    const MERCHANT_COUNT: usize = 100;
+
+    /// Performance regression threshold: a single poll cycle must complete
+    /// within this multiple of the configured poll interval.
+    const POLL_CYCLE_BUDGET_MULTIPLIER: u64 = 2;
+
+    /// Registers `count` merchants, each with a single wallet, and returns the
+    /// generated wallet addresses.
+    async fn seed_merchants_and_wallets(db: &PgPool, count: usize) -> Vec<String> {
+        let mut addresses = Vec::with_capacity(count);
+        for i in 0..count {
+            let merchant_id = sqlx::query_scalar::<_, uuid::Uuid>(
+                "INSERT INTO merchants (name, email) VALUES ($1, $2) RETURNING id",
+            )
+            .bind(format!("load-merchant-{i}"))
+            .bind(format!("load-merchant-{i}@example.test"))
+            .fetch_one(db)
+            .await
+            .expect("insert merchant");
+
+            let address = format!("GLOAD{i:055}");
+            sqlx::query(
+                "INSERT INTO wallets (merchant_id, address, network) VALUES ($1, $2, 'stellar')",
+            )
+            .bind(merchant_id)
+            .bind(&address)
+            .execute(db)
+            .await
+            .expect("insert wallet");
+
+            addresses.push(address);
+        }
+        addresses
+    }
+
+    /// Load test: with 100+ merchants registered, a single `poll_once` cycle
+    /// must complete within `2 * poll_interval_secs`.
+    ///
+    /// Requires a test database (`DATABASE_URL`) and a mock Horizon server
+    /// returning empty responses. Run with:
+    /// `cargo test -- --ignored deposit_worker_handles_100_concurrent_merchants`
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and a mock Horizon server"]
+    async fn deposit_worker_handles_100_concurrent_merchants() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let db = PgPool::connect(&database_url)
+            .await
+            .expect("connect test db");
+
+        let addresses = seed_merchants_and_wallets(&db, MERCHANT_COUNT).await;
+        assert_eq!(addresses.len(), MERCHANT_COUNT);
+
+        // Mock Horizon server returning empty responses for every account.
+        let horizon_url = std::env::var("MOCK_HORIZON_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8089".to_string());
+        let listener = StellarListener::new(horizon_url);
+
+        let poll_interval_secs: u64 = std::env::var("STELLAR_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let budget = Duration::from_secs(poll_interval_secs * POLL_CYCLE_BUDGET_MULTIPLIER);
+
+        let start = Instant::now();
+        poll_once(&db, &listener).await.expect("poll_once cycle");
+        let elapsed = start.elapsed();
+
+        println!(
+            "poll_once with {MERCHANT_COUNT} merchants took {elapsed:?} (budget {budget:?})"
+        );
+        assert!(
+            elapsed <= budget,
+            "poll_once took {elapsed:?}, exceeding the {budget:?} budget for {MERCHANT_COUNT} merchants"
+        );
+mod tests {
+    use super::*;
+    use crate::blockchain::stellar::DetectedDeposit;
+    use crate::otp::mock::MockOtpProvider;
+    use crate::otp::OtpProvider;
+    use crate::services::{balances, payment_requests, payments, wallets};
+    use crate::models::{NewPaymentRequest, NewWallet};
+
+    /// A mock [`BlockchainListener`] that returns a pre-seeded set of deposits
+    /// instead of querying a real Horizon node.
+    struct MockBlockchainListener {
+        deposits: Vec<DetectedDeposit>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlockchainListener for MockBlockchainListener {
+        async fn fetch_deposits(
+            &self,
+            _addresses: &[String],
+        ) -> Result<Vec<DetectedDeposit>, String> {
+            Ok(self.deposits.clone())
+        }
+    }
+
+    /// End-to-end integration test for the full merchant onboarding flow:
+    /// signup -> OTP verify -> create wallet -> create payment request ->
+    /// detect deposit -> check balance.
+    #[sqlx::test]
+    async fn merchant_onboarding_end_to_end(db: PgPool) {
+        // 1. Signup: create the merchant record.
+        let merchant = sqlx::query!(
+            r#"
+            INSERT INTO merchants (name, email, password_hash)
+            VALUES ($1, $2, $3)
+            RETURNING id
+            "#,
+            "Test Merchant",
+            "merchant@example.com",
+            "hashed-password",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("merchant signup should succeed");
+
+        // 2. OTP verify: use MockOtpProvider to skip real SMS.
+        let otp = MockOtpProvider::new();
+        let code = otp
+            .send_code("merchant@example.com")
+            .await
+            .expect("mock OTP send should succeed");
+        let verified = otp
+            .verify_code("merchant@example.com", &code)
+            .await
+            .expect("mock OTP verify should succeed");
+        assert!(verified, "OTP verification should succeed");
+
+        // 3. Create wallet for the merchant.
+        let wallet = wallets::create(
+            &db,
+            NewWallet {
+                merchant_id: merchant.id,
+                address: "GTESTWALLETADDRESS0000000000000000000000000000000000000000".into(),
+                network: "stellar".into(),
+            },
+        )
+        .await
+        .expect("wallet creation should succeed");
+
+        // 4. Create a payment request tied to the wallet via memo.
+        let memo = "onboarding-memo-1";
+        let amount_stroops: i64 = 10_000_000;
+        let payment_request = payment_requests::create(
+            &db,
+            NewPaymentRequest {
+                merchant_id: merchant.id,
+                wallet_id: wallet.id,
+                memo: memo.into(),
+                amount_stroops,
+                asset: "XLM".into(),
+            },
+        )
+        .await
+        .expect("payment request creation should succeed");
+
+        // 5. Detect deposit: inject a fake deposit through the mock listener.
+        let listener = MockBlockchainListener {
+            deposits: vec![DetectedDeposit {
+                tx_hash: "fake-tx-hash-1".into(),
+                destination: wallet.address.clone(),
+                amount_stroops,
+                asset: "XLM".into(),
+                memo: Some(memo.into()),
+            }],
+        };
+        poll_once(&db, &listener)
+            .await
+            .expect("deposit polling should succeed");
+
+        // 6. Check balance equals the injected deposit amount.
+        let balance = balances::get(&db, merchant.id, "XLM")
+            .await
+            .expect("balance lookup should succeed");
+        assert_eq!(
+            balance.available_stroops, amount_stroops,
+            "available balance should equal the deposit amount"
+        );
+
+        // 7. Assert the payment request status is 'paid'.
+        let updated = payment_requests::get(&db, payment_request.id)
+            .await
+            .expect("payment request lookup should succeed");
+        assert_eq!(updated.status, "paid", "payment request should be paid");
+    }
 }
