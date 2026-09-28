@@ -1,11 +1,17 @@
 use axum::extract::{Path, Query, State};
+use axum::http::header;
+use axum::http::{header, HeaderValue};
+use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
-use crate::error::{bad_request, internal, not_found, ApiResult, ErrorCode};
+use crate::error::{bad_request, bad_request_field, internal, not_found, ApiResult, ErrorCode};
 use crate::models::{CreatePaymentRequestRequest, PaymentRequest};
 use crate::pagination::{Cursor, Page};
 use crate::services::{payment_requests, wallets};
@@ -29,14 +35,38 @@ pub struct PaymentRequestView {
     pub sep7_uri: Option<String>,
 }
 
+/// Lightweight public polling payload for customers waiting on a QR payment.
+#[derive(Serialize)]
+pub struct PaymentRequestStatusView {
+    pub status: String,
+    /// Present when `status` is `paid` — the row's `updated_at` at mark-paid time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paid_at: Option<DateTime<Utc>>,
+}
+
 pub async fn create(
     State(state): State<AppState>,
     auth: AuthUser,
-    Json(req): Json<CreatePaymentRequestRequest>,
+    Json(body): Json<Value>,
 ) -> ApiResult<Json<PaymentRequestView>> {
+    let req = CreatePaymentRequestRequest::from_json(&body)
+        .map_err(|(field, msg)| bad_request_field(field, msg))?;
+
     let merchant_id = auth
         .merchant_id
         .ok_or_else(|| bad_request(ErrorCode::MerchantNotFound, "no merchant associated with this account"))?;
+
+    // Refuse if the merchant is suspended.
+    let merchant = crate::services::users::merchant_by_id(&state.db, merchant_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| bad_request(ErrorCode::MerchantNotFound, "merchant not found"))?;
+    if merchant.is_suspended() {
+        return Err(crate::error::forbidden(
+            ErrorCode::Forbidden,
+            "this merchant account has been suspended",
+        ));
+    }
 
     let wallet = wallets::wallet_by_merchant(&state.db, merchant_id)
         .await
@@ -75,6 +105,102 @@ pub async fn get(
         .ok_or_else(|| internal("payment request references a missing wallet"))?;
 
     Ok(Json(to_view(&pr, &wallet.address, &wallet.network)))
+}
+
+/// Renders the payment request's SEP-0007 URI as a PNG QR code so merchants
+/// can display it directly at a POS terminal without a client-side QR library.
+///
+/// The rendered image is cached in-process keyed by `(id, size)`; the SEP-0007
+/// URI for a given request is immutable, so the cache never needs invalidation.
+pub async fn qr(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(params): Query<QrParams>,
+) -> ApiResult<impl IntoResponse> {
+    let size = params.size.unwrap_or(256).clamp(64, 1024) as u32;
+
+/// Public, cache-friendly status-only poll for customer devices after they
+/// scan a QR. Prefer this over `GET /payment-requests/{id}` when only the
+/// payment outcome is needed.
+pub async fn status(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    let pr = payment_requests::payment_request_by_id(&state.db, id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| not_found(ErrorCode::PaymentRequestNotFound, "payment request not found"))?;
+
+    let wallet = wallets::wallet_by_id(&state.db, pr.wallet_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| internal("payment request references a missing wallet"))?;
+
+    let sep7_uri = build_sep7_uri(&wallet.address, pr.amount_stroops, &pr.asset, &pr.memo)
+        .ok_or_else(|| {
+            bad_request(
+                ErrorCode::InvalidParameters,
+                "this payment request has no SEP-0007 URI to encode",
+            )
+        })?;
+
+    let png = qr_png_cached(id, size, &sep7_uri)?;
+
+    Ok(([(header::CONTENT_TYPE, "image/png")], png))
+}
+
+#[derive(serde::Deserialize)]
+pub struct QrParams {
+    pub size: Option<i64>,
+}
+
+/// In-process cache of rendered QR PNGs keyed by `(payment request id, size)`.
+fn qr_cache() -> &'static Mutex<HashMap<(Uuid, u32), Vec<u8>>> {
+    static CACHE: OnceLock<Mutex<HashMap<(Uuid, u32), Vec<u8>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn qr_png_cached(id: Uuid, size: u32, contents: &str) -> ApiResult<Vec<u8>> {
+    let key = (id, size);
+    if let Some(cached) = qr_cache().lock().unwrap().get(&key) {
+        return Ok(cached.clone());
+    }
+
+    let png = render_qr_png(contents, size)?;
+    qr_cache().lock().unwrap().insert(key, png.clone());
+    Ok(png)
+}
+
+fn render_qr_png(contents: &str, size: u32) -> ApiResult<Vec<u8>> {
+    use qrcode::QrCode;
+
+    let code = QrCode::new(contents.as_bytes())
+        .map_err(|_| internal("failed to encode SEP-0007 URI as a QR code"))?;
+    let image = code
+        .render::<image::Luma<u8>>()
+        .min_dimensions(size, size)
+        .build();
+
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|_| internal("failed to encode QR code as PNG"))?;
+    Ok(png)
+    let status = effective_status(&pr.status, pr.expires_at);
+    let paid_at = if status == "paid" {
+        Some(pr.updated_at)
+    } else {
+        None
+    };
+
+    let mut response = Json(PaymentRequestStatusView { status, paid_at }).into_response();
+    // Short TTL so CDN/browser can coalesce rapid polls without serving stale
+    // "pending" for long after a payment flips to paid.
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=5"),
+    );
+    Ok(response)
 }
 
 pub async fn list(
